@@ -168,6 +168,28 @@ impl<'a, C: CurveAffine> MSM<'a, C> {
 
         bool::from(best_multiexp(&scalars, &bases).is_identity())
     }
+
+    /// The MSM's accumulated terms, exposed for capturing the verifier fingerprint without consuming
+    /// it: the `g_scalars` (coefficients of the SRS generators `params.g`), `w_scalar` and `u_scalar`
+    /// (coefficients of `params.w` and `params.u`), and the `other` terms as `(scalar, x, y)` for each
+    /// accumulated commitment point. This is exactly the data `eval` combines.
+    #[cfg(feature = "verifier-fingerprint")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn fingerprint_terms(
+        &self,
+    ) -> (
+        Option<Vec<C::Scalar>>,
+        Option<C::Scalar>,
+        Option<C::Scalar>,
+        Vec<(C::Scalar, C::Base, C::Base)>,
+    ) {
+        let other = self
+            .other
+            .iter()
+            .map(|(x, (scalar, y))| (*scalar, *x, *y))
+            .collect();
+        (self.g_scalars.clone(), self.w_scalar, self.u_scalar, other)
+    }
 }
 
 #[cfg(test)]
