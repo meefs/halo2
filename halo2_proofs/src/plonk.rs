@@ -26,6 +26,10 @@ mod vanishing;
 mod prover;
 mod verifier;
 
+#[cfg(feature = "verifier-fingerprint")]
+#[cfg_attr(docsrs, doc(cfg(feature = "verifier-fingerprint")))]
+pub mod fingerprint;
+
 pub use assigned::*;
 pub use circuit::*;
 pub use error::*;

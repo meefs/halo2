@@ -7,6 +7,8 @@ use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::circuit::{Cell, Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::dev::MockProver;
 use halo2_proofs::pasta::{Eq, EqAffine, Fp};
+#[cfg(feature = "verifier-fingerprint")]
+use halo2_proofs::plonk::fingerprint::{capture_proof_fingerprint, ChallengeRecorder};
 use halo2_proofs::plonk::{
     create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Assigned, BatchVerifier, Circuit,
     Column, ConstraintSystem, Error, Fixed, SingleVerifier, TableColumn, VerificationStrategy,
@@ -552,6 +554,43 @@ fn plonk_api() {
                 &mut transcript,
             )
             .is_ok());
+        }
+
+        //
+        // Capture the verifier fingerprint (the assembled MSM) without treating capture as
+        // acceptance.
+        //
+
+        #[cfg(feature = "verifier-fingerprint")]
+        {
+            // Record the Fiat-Shamir challenges alongside the MSM, so an independent (Lean) model can
+            // assemble the same fingerprint at identical challenges.
+            let mut transcript = ChallengeRecorder::<_, _, Challenge255<_>>::init(&proof[..]);
+            let msm = capture_proof_fingerprint(
+                &params,
+                pk.get_vk(),
+                &[&[&pubinputs[..]], &[&pubinputs[..]]],
+                &mut transcript,
+            )
+            .expect("fingerprint capture should not fail");
+            let challenges = transcript.challenges;
+
+            // The verifier collapses its whole check into this one MSM (the fingerprint).
+            assert!(
+                !challenges.is_empty(),
+                "should record the verifier's Fiat-Shamir challenges"
+            );
+            eprintln!(
+                "captured verifier fingerprint with {} challenges",
+                challenges.len(),
+            );
+
+            // The captured MSM is exactly the verifier's accept check: the group identity for a valid
+            // proof (the same test `SingleVerifier` performs).
+            assert!(
+                msm.eval(),
+                "captured fingerprint must be the identity for a valid proof"
+            );
         }
 
         //
