@@ -173,7 +173,7 @@ impl<'a, C: CurveAffine> MSM<'a, C> {
     /// it: the `g_scalars` (coefficients of the SRS generators `params.g`), `w_scalar` and `u_scalar`
     /// (coefficients of `params.w` and `params.u`), and the `other` terms as `(scalar, x, y)` for each
     /// accumulated commitment point. This is exactly the data `eval` combines.
-    #[cfg(feature = "verifier-fingerprint")]
+    #[cfg(feature = "unstable-verifier-fingerprint")]
     #[allow(clippy::type_complexity)]
     pub(crate) fn fingerprint_terms(
         &self,

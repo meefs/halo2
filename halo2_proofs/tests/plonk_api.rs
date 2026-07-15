@@ -7,7 +7,7 @@ use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::circuit::{Cell, Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::dev::MockProver;
 use halo2_proofs::pasta::{Eq, EqAffine, Fp};
-#[cfg(feature = "verifier-fingerprint")]
+#[cfg(feature = "unstable-verifier-fingerprint")]
 use halo2_proofs::plonk::fingerprint::{capture_proof_fingerprint, ChallengeRecorder};
 use halo2_proofs::plonk::{
     create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Assigned, BatchVerifier, Circuit,
@@ -561,7 +561,7 @@ fn plonk_api() {
         // acceptance.
         //
 
-        #[cfg(feature = "verifier-fingerprint")]
+        #[cfg(feature = "unstable-verifier-fingerprint")]
         {
             // Record the Fiat-Shamir challenges alongside the MSM, so an independent (Lean) model can
             // assemble the same fingerprint at identical challenges.
@@ -573,17 +573,43 @@ fn plonk_api() {
                 &mut transcript,
             )
             .expect("fingerprint capture should not fail");
-            let challenges = transcript.challenges;
 
             // The verifier collapses its whole check into this one MSM (the fingerprint).
             assert!(
-                !challenges.is_empty(),
+                !transcript.challenges.is_empty(),
                 "should record the verifier's Fiat-Shamir challenges"
             );
             eprintln!(
                 "captured verifier fingerprint with {} challenges",
-                challenges.len(),
+                transcript.challenges.len(),
             );
+
+            // Exercise the Lean fixture exporter end-to-end: it must consume the captured run
+            // without tripping any of its transcript-shape assertions, and emit the expected
+            // definitions and match theorem. (Two proofs were captured above.)
+            let fixture = pk.get_vk().dump_vesta_lean_fixture(
+                "Halo2.Fixture.PlonkApi",
+                "plonk_api",
+                K,
+                2,
+                &transcript,
+                &msm,
+            );
+            for expected in [
+                "namespace Halo2.Fixture.PlonkApi",
+                "def shape : Shape",
+                "def vk : VerifyingKey shape Fp G",
+                "def ps : ProofString shape Fp G",
+                "def ch : Challenges shape.k Fp",
+                "def capturedMsm : Msm shape.k Fp G",
+                "theorem fingerprint_matches",
+                "end Halo2.Fixture.PlonkApi",
+            ] {
+                assert!(
+                    fixture.contains(expected),
+                    "generated Lean fixture is missing `{expected}`"
+                );
+            }
 
             // The captured MSM is exactly the verifier's accept check: the group identity for a valid
             // proof (the same test `SingleVerifier` performs).

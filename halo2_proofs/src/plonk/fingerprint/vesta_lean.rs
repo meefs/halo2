@@ -8,14 +8,22 @@
 //! Scalar and base field elements are emitted as four little-endian `u64` limbs (`mkFp`/`mkFq`).
 //! Commitments and the complete verifier URS are emitted as validated concrete Vesta points, shared
 //! across the VK, proof string, transcript, and MSM.
+//!
+//! Trust boundary: the fixture attests that the assembled MSM matches, and evaluates to the
+//! identity, for *these* captured commitments and challenges. It does not re-derive the instance
+//! commitments from the public inputs (they enter as opaque points, like every other commitment),
+//! nor does it reproduce Halo2's Blake2b transcript or pinned-key serialization; those remain
+//! trusted from the Rust capture.
 
 use ff::PrimeField;
 use std::collections::HashMap;
+use std::io::Read;
 
-use super::TranscriptEvent;
+use super::{ChallengeRecorder, TranscriptEvent};
 use crate::arithmetic::{Coordinates, CurveAffine};
 use crate::pasta::{EqAffine, Fp, Fq};
 use crate::poly::commitment::MSM;
+use crate::transcript::Challenge255;
 
 use super::super::circuit::{Any, Expression};
 use super::super::VerifyingKey;
@@ -24,6 +32,10 @@ use super::super::VerifyingKey;
 fn field<F: PrimeField>(constructor: &str, x: F) -> String {
     let repr = x.to_repr();
     let b = repr.as_ref();
+    debug_assert!(
+        b.len() <= 32,
+        "field repr is wider than the four u64 limbs emitted here; extra bytes would be silently dropped"
+    );
     let limb = |i: usize| -> u64 {
         let mut v: u64 = 0;
         let mut j = 0;
@@ -215,24 +227,26 @@ fn render_transcript_capture(
 
 impl VerifyingKey<EqAffine> {
     /// Emit the Vesta Lean fixture for one captured proof (see module docs).
-    /// `read_points`/`read_scalars`
-    /// are the proof elements in read order, `common_points` the instance commitments, `challenges`
-    /// the squeezed challenges, `transcript_events` the ordered verifier transcript events, and
-    /// `captured_msm` the assembled verifier fingerprint and its exact parameter set.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dump_vesta_lean_fixture(
+    ///
+    /// `recorder` supplies the ordered transcript events, the proof elements (points and scalars in
+    /// read order), the instance commitments, and the squeezed challenges captured during the
+    /// verifier run; `captured_msm` is the assembled verifier fingerprint together with its exact
+    /// parameter set.
+    pub fn dump_vesta_lean_fixture<R: Read>(
         &self,
         lean_namespace: &str,
         circuit_id: &str,
         k: u32,
         num_proofs: usize,
-        common_points: &[EqAffine],
-        read_points: &[EqAffine],
-        read_scalars: &[Fp],
-        challenges: &[Fp],
-        transcript_events: &[TranscriptEvent<EqAffine>],
+        recorder: &ChallengeRecorder<R, EqAffine, Challenge255<EqAffine>>,
         captured_msm: &MSM<'_, EqAffine>,
     ) -> String {
+        let common_points = recorder.common_points.as_slice();
+        let read_points = recorder.points.as_slice();
+        let read_scalars = recorder.scalars.as_slice();
+        let challenges = recorder.challenges.as_slice();
+        let transcript_events = recorder.events.as_slice();
+
         let params = captured_msm.params;
         let (msm_g, msm_w, msm_u, msm_other) = captured_msm.fingerprint_terms();
         let msm_g = msm_g.expect("captured MSM must contain verifier-generator coefficients");
@@ -244,6 +258,13 @@ impl VerifyingKey<EqAffine> {
         let n_lookups = cs.lookups.len();
         let chunk_len = self.cs_degree - 2;
         let perm_columns = cs.permutation.get_columns();
+        // A zero chunk length is only consistent with there being no permutation columns; otherwise
+        // `n_perm_sets` below and the chunk-export loop (which falls back to `chunk_len.max(1)`)
+        // would disagree on how many sets exist.
+        assert!(
+            chunk_len > 0 || perm_columns.is_empty(),
+            "permutation columns present but chunk length is zero"
+        );
         let n_perm_sets = if chunk_len == 0 {
             0
         } else {
