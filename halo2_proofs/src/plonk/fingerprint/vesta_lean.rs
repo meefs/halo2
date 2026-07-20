@@ -13,10 +13,21 @@
 //! identity, for *these* captured commitments and challenges. It does not re-derive the instance
 //! commitments from the public inputs (they enter as opaque points, like every other commitment),
 //! nor does it reproduce Halo2's Blake2b transcript or pinned-key serialization; those remain
-//! trusted from the Rust capture.
+//! trusted from the Rust capture. Halo2's `MSM` also merges same-base terms and drops identity
+//! bases, where the Lean assembly deliberately does neither; such a capture is rejected at export
+//! (see [`VerifyingKey::dump_vesta_lean_fixture`]) rather than emitted.
+//!
+//! Only accepting runs are exported. [`VerifyingKey::dump_vesta_lean_fixture`] verifies the captured
+//! MSM is the group identity before emitting anything, so every exported fixture proves
+//! `capturedMsm.evalNat capturedURS = 0` and Lean checks exact MSM agreement against it. Invalid
+//! captures are not modelled in Lean: they are rejected by the deployed verifier (or checked as
+//! non-identity) in Rust, which is where the negative-path coverage lives. Exporting a rejecting
+//! run as its own fixture was considered and dropped in favour of this fail-fast: it doubled the
+//! exporter surface for a cross-check that a trivially-accepting Lean `assemble` would already fail
+//! on the accepting fixtures.
 
 use ff::PrimeField;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 
 use super::{ChallengeRecorder, TranscriptEvent};
@@ -66,6 +77,16 @@ fn fp(x: Fp) -> String {
 /// A Vesta base-field element as a Lean `mkFq` call (four little-endian `u64` limbs).
 fn fq(x: Fq) -> String {
     field("mkFq", x)
+}
+
+/// Whether `segment` is a conservative ASCII subset of a Lean identifier: non-empty, starting with a
+/// letter or `_`, and otherwise containing only ASCII alphanumerics and `_`. A digit-leading segment
+/// (e.g. `123`) is rejected, so a dotted `lean_namespace` spliced verbatim into `namespace`/`end`
+/// cannot emit a token Lean would reject.
+fn is_lean_ident(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Coordinate key for a point's identity (its affine `(x, y)` repr; identity → sentinel).
@@ -231,7 +252,8 @@ impl VerifyingKey<EqAffine> {
     /// `recorder` supplies the ordered transcript events, the proof elements (points and scalars in
     /// read order), the instance commitments, and the squeezed challenges captured during the
     /// verifier run; `captured_msm` is the assembled verifier fingerprint together with its exact
-    /// parameter set.
+    /// parameter set. Only *accepting* runs are exported: `captured_msm` is verified to be the group
+    /// identity before anything is emitted, so the fixture always proves `capturedMsm.evalNat = 0`.
     pub fn dump_vesta_lean_fixture<R: Read>(
         &self,
         lean_namespace: &str,
@@ -241,6 +263,27 @@ impl VerifyingKey<EqAffine> {
         recorder: &ChallengeRecorder<R, EqAffine, Challenge255<EqAffine>>,
         captured_msm: &MSM<'_, EqAffine>,
     ) -> String {
+        // `lean_namespace` is spliced verbatim into `namespace`/`end`, and `circuit_id` is emitted
+        // via `{:?}`, whose Rust string escapes (`\u{...}`, ...) are not Lean's. Validate both up
+        // front — in release builds too, since this runs once per export and a malformed name yields
+        // an uncompilable fixture. [`is_lean_ident`] accepts a conservative ASCII subset of Lean
+        // identifiers, so a digit-leading `lean_namespace` segment like `123` is rejected.
+        assert!(
+            lean_namespace.split('.').all(is_lean_ident),
+            "lean_namespace must be a dot-separated path of ASCII Lean identifiers \
+             (letter/underscore start): {lean_namespace:?}"
+        );
+        // `circuit_id` becomes a Lean *string literal*, not an identifier, so a leading digit is
+        // fine; it only has to stay a plain ASCII slug so `{:?}` cannot emit a `\u{...}` escape Lean
+        // would reject.
+        assert!(
+            !circuit_id.is_empty()
+                && circuit_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "circuit_id must be a non-empty ASCII slug (alphanumeric, `_`, `-`): {circuit_id:?}"
+        );
+
         let common_points = recorder.common_points.as_slice();
         let read_points = recorder.points.as_slice();
         let read_scalars = recorder.scalars.as_slice();
@@ -248,6 +291,13 @@ impl VerifyingKey<EqAffine> {
         let transcript_events = recorder.events.as_slice();
 
         let params = captured_msm.params;
+        // The emitted `capturedMsm_eval_eq_zero` presupposes an accepting capture; fail fast here
+        // rather than export a fixture whose theorem cannot hold. Rejecting captures are checked in
+        // Rust (they are non-identity / rejected by the deployed verifier), never exported to Lean.
+        assert!(
+            captured_msm.clone().eval(),
+            "captured MSM must evaluate to the identity; the emitted fixture proves it"
+        );
         let (msm_g, msm_w, msm_u, msm_other) = captured_msm.fingerprint_terms();
         let msm_g = msm_g.expect("captured MSM must contain verifier-generator coefficients");
         let msm_w = msm_w.expect("captured MSM must contain a blinding-generator coefficient");
@@ -363,28 +413,92 @@ impl VerifyingKey<EqAffine> {
         let urs_w = points.point_ref(params.w);
         let urs_u = points.point_ref(params.u);
 
-        // ---- slice read points into blocks (verifier read order) ----
+        // The blocks below are a hand-maintained mirror of the verifier's read schedule; the
+        // count asserts alone cannot catch an equal-length reordering. The Fiat-Shamir squeezes
+        // delimit each phase of that schedule, so recover how many points/scalars had been read
+        // before each squeeze and pin every block boundary that a squeeze delimits against it.
+        // The challenges are, in squeeze order: θ, β, γ, y, x, x1, x2, x3, x4, ξ, z, then one per
+        // IPA round.
+        let (points_before_squeeze, scalars_before_squeeze): (Vec<usize>, Vec<usize>) = {
+            let mut points_at = Vec::with_capacity(challenges.len());
+            let mut scalars_at = Vec::with_capacity(challenges.len());
+            let (mut np, mut ns) = (0usize, 0usize);
+            for event in transcript_events {
+                match event {
+                    TranscriptEvent::ReadPoint(_) => np += 1,
+                    TranscriptEvent::ReadScalar(_) => ns += 1,
+                    TranscriptEvent::Squeeze(_) => {
+                        points_at.push(np);
+                        scalars_at.push(ns);
+                    }
+                    _ => {}
+                }
+            }
+            (points_at, scalars_at)
+        };
+        assert_eq!(points_before_squeeze.len(), challenges.len());
+        // Squeeze indices into the challenge/`*_before_squeeze` vectors.
+        const THETA: usize = 0;
+        const BETA: usize = 1;
+        const GAMMA: usize = 2;
+        const Y: usize = 3;
+        const X: usize = 4;
+        const X1: usize = 5;
+        const X2: usize = 6;
+        const X3: usize = 7;
+        const X4: usize = 8;
+        const XI: usize = 9;
+        const Z: usize = 10;
+        const IPA_ROUND_BASE: usize = 11;
+
+        // ---- slice read points into blocks (verifier read order), pinning each squeeze-delimited
+        //      boundary against `points_before_squeeze` ----
         let mut pi = 0usize;
         let advice_pts = &read_points[pi..pi + num_proofs * n_advice];
         pi += num_proofs * n_advice;
+        // θ is squeezed once all advice commitments have been read.
+        assert_eq!(pi, points_before_squeeze[THETA]);
         let lookup_perm_pts = &read_points[pi..pi + num_proofs * n_lookups * 2];
         pi += num_proofs * n_lookups * 2;
+        // β, then γ with no reads between them, follow the lookup permuted commitments.
+        assert_eq!(pi, points_before_squeeze[BETA]);
+        assert_eq!(points_before_squeeze[GAMMA], points_before_squeeze[BETA]);
         let perm_prod_pts = &read_points[pi..pi + num_proofs * n_perm_sets];
         pi += num_proofs * n_perm_sets;
         let lookup_prod_pts = &read_points[pi..pi + num_proofs * n_lookups];
         pi += num_proofs * n_lookups;
         let vanishing_random = read_points[pi];
         pi += 1;
+        // y is squeezed after the permutation/lookup products and the pre-y vanishing commitment.
+        assert_eq!(pi, points_before_squeeze[Y]);
         let h_pts = &read_points[pi..pi + n_quotient];
         pi += n_quotient;
+        // x is squeezed after the quotient (h) pieces; x1 and x2 follow with no points between.
+        assert_eq!(pi, points_before_squeeze[X]);
+        assert_eq!(points_before_squeeze[X1], points_before_squeeze[X]);
+        assert_eq!(points_before_squeeze[X2], points_before_squeeze[X]);
         let q_prime = read_points[pi];
         pi += 1;
+        // x3 is squeezed after q'; x4 follows with no points between (only the multiopen u scalars).
+        assert_eq!(pi, points_before_squeeze[X3]);
+        assert_eq!(points_before_squeeze[X4], points_before_squeeze[X3]);
         let ipa_s = read_points[pi];
         pi += 1;
+        // ξ is squeezed after the IPA s commitment; z follows with no reads between.
+        assert_eq!(pi, points_before_squeeze[XI]);
+        assert_eq!(points_before_squeeze[Z], points_before_squeeze[XI]);
         let ipa_round_pts = &read_points[pi..]; // 2*k points (L, R per round)
         assert_eq!(ipa_round_pts.len(), 2 * k as usize);
+        // Each IPA round reads its (L, R) pair immediately before squeezing that round's challenge.
+        for round in 0..k as usize {
+            assert_eq!(
+                points_before_squeeze[IPA_ROUND_BASE + round],
+                pi + 2 * (round + 1)
+            );
+        }
 
-        // ---- slice read scalars into blocks ----
+        // ---- slice read scalars into blocks, pinning each squeeze-delimited boundary against
+        //      `scalars_before_squeeze` ----
         let mut si = 0usize;
         let instance_evals = &read_scalars[si..si + num_proofs * n_inst_q];
         si += num_proofs * n_inst_q;
@@ -405,13 +519,106 @@ impl VerifyingKey<EqAffine> {
         si += num_proofs * perm_set_count;
         let lookup_evals = &read_scalars[si..si + num_proofs * n_lookups * 5];
         si += num_proofs * n_lookups * 5;
+        // All evaluations at x are read before x1 is squeezed; x2 and x3 follow with no scalars
+        // between them (only the q' point read).
+        assert_eq!(si, scalars_before_squeeze[X1]);
+        assert_eq!(scalars_before_squeeze[X2], scalars_before_squeeze[X1]);
+        assert_eq!(scalars_before_squeeze[X3], scalars_before_squeeze[X1]);
         assert!(read_scalars.len() >= si + 2);
         let n_point_sets = read_scalars.len() - 2 - si;
         let multiopen_u = &read_scalars[si..si + n_point_sets];
         si += n_point_sets;
+        // x4 is squeezed after the multiopen u-evaluations; ξ, z, and every IPA-round squeeze then
+        // precede the final c/f scalars, which are read only after the last squeeze.
+        assert_eq!(si, scalars_before_squeeze[X4]);
+        assert_eq!(scalars_before_squeeze[XI], si);
+        assert_eq!(scalars_before_squeeze[Z], si);
+        for round in 0..k as usize {
+            assert_eq!(scalars_before_squeeze[IPA_ROUND_BASE + round], si);
+        }
         let ipa_c = read_scalars[si];
         let ipa_f = read_scalars[si + 1];
         assert_eq!(si + 2, read_scalars.len());
+
+        // ---- fail fast if the capture cannot possibly match in Lean ----
+        //
+        // Halo2's `MSM` keys terms by base coordinate and drops the identity, whereas the Lean
+        // `assemble` appends one `other` term per protocol commitment slot and keeps every one. So
+        // if two distinct slots share a base coordinate (e.g. two identically-assigned fixed
+        // columns, or two proofs with equal instance commitments), or any slot is the identity, the
+        // captured MSM carries strictly fewer `other` terms than `assemble`, and `fingerprint_matches`
+        // — a permutation comparison with no merging — cannot hold. Diagnose that here instead of
+        // deferring to an opaque Lean failure on a fixture that can never be discharged.
+        //
+        // The base slots are reconstructed from the same query layout the verifier consumes: one
+        // slot per (proof, distinct queried instance/advice column), one per queried fixed column,
+        // one per permutation-common / permutation-product / lookup / quotient (`h`) piece
+        // commitment, plus the vanishing-random commitment, `q'`, the IPA `s`, and each IPA `L`/`R`.
+        let distinct = |mut cols: Vec<usize>| {
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        };
+        let inst_cols = distinct(cs.instance_queries.iter().map(|(c, _)| c.index()).collect());
+        let adv_cols = distinct(cs.advice_queries.iter().map(|(c, _)| c.index()).collect());
+        let fix_cols = distinct(cs.fixed_queries.iter().map(|(c, _)| c.index()).collect());
+        let mut msm_base_slots: Vec<EqAffine> = Vec::new();
+        for p in 0..num_proofs {
+            for &col in &inst_cols {
+                msm_base_slots.push(common_points[p * n_inst_cols + col]);
+            }
+            for &col in &adv_cols {
+                msm_base_slots.push(advice_pts[p * n_advice + col]);
+            }
+        }
+        for &col in &fix_cols {
+            msm_base_slots.push(self.fixed_commitments[col]);
+        }
+        msm_base_slots.extend_from_slice(self.permutation.commitments());
+        msm_base_slots.extend_from_slice(perm_prod_pts);
+        msm_base_slots.extend_from_slice(lookup_perm_pts);
+        msm_base_slots.extend_from_slice(lookup_prod_pts);
+        msm_base_slots.push(vanishing_random);
+        msm_base_slots.extend_from_slice(h_pts);
+        msm_base_slots.push(q_prime);
+        msm_base_slots.push(ipa_s);
+        msm_base_slots.extend_from_slice(ipa_round_pts);
+
+        let slot_coords: BTreeSet<Vec<u8>> = msm_base_slots
+            .iter()
+            .filter_map(|point| {
+                let coords: Option<Coordinates<EqAffine>> = point.coordinates().into();
+                // Halo2 drops the identity from the MSM, so it is not a captured base coordinate.
+                coords.map(|_| point_key(*point))
+            })
+            .collect();
+        let captured_coords: BTreeSet<Vec<u8>> = msm_other
+            .iter()
+            .map(|(_, x, y)| {
+                let point: Option<EqAffine> = EqAffine::from_xy(*x, *y).into();
+                point_key(point.expect("captured MSM base must be a valid affine point"))
+            })
+            .collect();
+        // Self-check: the reconstructed slot bases must reproduce the captured MSM's actual bases.
+        // A mismatch means the verifier read/query schedule assumed above has drifted from the
+        // deployed verifier, so the reconstruction (and the guard below) can no longer be trusted.
+        assert_eq!(
+            slot_coords, captured_coords,
+            "exporter's MSM base-slot reconstruction does not match the captured MSM bases; the \
+             assumed verifier read/query schedule is stale"
+        );
+        // The guard: with all-distinct, non-identity bases the slot count equals the captured term
+        // count. Any shortfall means Halo2 merged same-base terms or dropped an identity base.
+        assert_eq!(
+            msm_base_slots.len(),
+            msm_other.len(),
+            "captured MSM collapsed {} protocol commitment slots into {} terms by merging same-base \
+             terms or dropping identity bases; the Lean assembly does neither, so the emitted \
+             `fingerprint_matches` could not hold. Capture a proof whose commitments are all \
+             distinct and non-identity.",
+            msm_base_slots.len(),
+            msm_other.len()
+        );
 
         let mut out = String::new();
 
@@ -428,6 +635,14 @@ impl VerifyingKey<EqAffine> {
             "def capturedURS : URS G := {{ k := {}, g := fun i => capturedUrsG.getD i.val 0, w := {}, u := {} }}\n\n",
             k, urs_w, urs_u
         ));
+        // `capturedURS.g` indexes `capturedUrsG` with `getD`, which silently yields the identity for
+        // any index past the list's end; pin the length so a truncated URS cannot pass unnoticed.
+        out.push_str(
+            "/-- The captured URS lists exactly the `2 ^ k` generators the MSM evaluates\n",
+        );
+        out.push_str("against, so `capturedURS.g`'s `getD` never substitutes the identity for a\n");
+        out.push_str("missing generator. -/\n");
+        out.push_str("theorem capturedUrsG_length : capturedUrsG.length = 2 ^ shape.k := by native_decide\n\n");
         out.push_str(&format!(
             "def capturedVkTranscriptRepr : Fp := {}\n\n",
             fp(self.transcript_repr)
@@ -761,7 +976,15 @@ impl VerifyingKey<EqAffine> {
         out.push_str(
             "/-- Captured verifier Fiat-Shamir schedule, including the captured prefix.\n",
         );
-        out.push_str("Generated from `ChallengeRecorder`'s ordered absorb/squeeze events. -/\n");
+        out.push_str(
+            "Generated from `ChallengeRecorder`'s ordered absorb/squeeze events. After each\n",
+        );
+        out.push_str(
+            "squeeze the captured challenge is appended as an abstract separator (mirroring\n",
+        );
+        out.push_str(
+            "`deriveChallenges`); the deployed Blake2b transcript uses a domain-prefix byte. -/\n",
+        );
         out.push_str("def capturedScheduleEntries : List (List (TranscriptElt Fp G) × Fp) :=\n");
         out.push_str(&format!("  [{}]\n\n", schedule_entries.join(", ")));
 
@@ -785,6 +1008,12 @@ impl VerifyingKey<EqAffine> {
 
         out.push_str("theorem fingerprint_matches : MsmMatch (assemble vk ps ch) capturedMsm := by native_decide\n\n");
         out.push_str("theorem capturedMsm_eval_eq_zero : capturedMsm.evalNat capturedURS = 0 := by native_decide\n\n");
+        out.push_str(
+            "/-- Meaningful jointly with `fingerprint_matches`: `assemble`'s zero-MSM rejection\n",
+        );
+        out.push_str(
+            "fallback also evaluates to zero, so this statement alone is not acceptance. -/\n",
+        );
         out.push_str("theorem assembledMsm_eval_eq_zero : (assemble vk ps ch).evalNat capturedURS = 0 := by\n");
         out.push_str("  rw [msmMatch_evalNat capturedURS fingerprint_matches]\n");
         out.push_str("  exact capturedMsm_eval_eq_zero\n\n");
@@ -862,5 +1091,21 @@ mod tests {
         assert_eq!(schedule_entries.len(), 2);
         assert!(schedule_entries[0].ends_with(&format!(", {})", fp(theta))));
         assert!(schedule_entries[1].ends_with(&format!(", {})", fp(beta))));
+    }
+
+    #[test]
+    fn lean_identifier_grammar() {
+        // Accepted: letter/underscore start, ASCII alphanumerics and `_` thereafter.
+        assert!(is_lean_ident("Halo2"));
+        assert!(is_lean_ident("_private"));
+        assert!(is_lean_ident("Fixture0"));
+        // Rejected: empty, digit-leading (the case release builds previously waved through), and
+        // any non-`_` punctuation (a dotted path is validated segment-by-segment by the caller).
+        assert!(!is_lean_ident(""));
+        assert!(!is_lean_ident("123"));
+        assert!(!is_lean_ident("0abc"));
+        assert!(!is_lean_ident("has-hyphen"));
+        assert!(!is_lean_ident("has.dot"));
+        assert!(!is_lean_ident("has space"));
     }
 }
