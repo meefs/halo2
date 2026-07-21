@@ -8,7 +8,7 @@
 //! the exporter's identity fail-fast refuses a non-identity (rejecting) capture.
 #![cfg(feature = "unstable-verifier-fingerprint")]
 
-use group::ff::Field;
+use group::ff::{Field, PrimeField};
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::dev::MockProver;
 use halo2_proofs::pasta::{EqAffine, Fp};
@@ -195,7 +195,7 @@ fn exports_accepting_fixture() {
         "Halo2.Fixture.Render",
         "render_accept",
         K,
-        1,
+        &[&[&pubinputs[..]]],
         &transcript,
         &msm,
     );
@@ -210,6 +210,15 @@ fn exports_accepting_fixture() {
         "theorem fingerprint_matches",
         "theorem capturedMsm_eval_eq_zero",
         "theorem assembledMsm_eval_eq_zero",
+        // Instance-commitment derivation (public inputs -> C_inst).
+        "def capturedUrsGLagrange : List G",
+        "def capturedPublicInstances : List (List Fp)",
+        "def commitLagrange (coeffs : List Fp) : G",
+        "def derivedInstanceCommitment (p : Fin shape.numProofs) (i : ℕ) : G",
+        "theorem capturedPublicInstances_within_lagrange",
+        "theorem instance_commitments_derived :\n    capturedPublicInstances.map commitLagrange = capturedInstanceCommitments := by native_decide",
+        // The instance commitment `assemble` consumes is the derived one, not a VK field.
+        "MsmMatch (assemble vk derivedInstanceCommitment ps ch) capturedMsm",
         "end Halo2.Fixture.Render",
     ] {
         assert!(
@@ -217,6 +226,33 @@ fn exports_accepting_fixture() {
             "accepting fixture is missing `{expected}`"
         );
     }
+    // The exported `vk` mirrors the Rust `VerifyingKey`: it must NOT carry an `instanceCommitment`
+    // field (that value is computed per proof from the public inputs, not stored on the VK).
+    assert!(
+        !fixture.contains("instanceCommitment :="),
+        "exported vk must not carry an instanceCommitment field; it must mirror the Rust VK"
+    );
+    // `RenderCircuit` has one instance column carrying a single public input (`product`), so exactly
+    // one Lagrange generator is reachable and the sole captured instance is that public value.
+    assert!(
+        fixture.contains(&format!(
+            "def capturedPublicInstances : List (List Fp) := [[{}]]",
+            {
+                // Mirror the exporter's `fp` limb encoding for the single public input.
+                let repr = product.to_repr();
+                let b = repr.as_ref();
+                let limb = |i: usize| -> u64 {
+                    let mut v = 0u64;
+                    for j in 0..8 {
+                        v |= (b[i * 8 + j] as u64) << (8 * j);
+                    }
+                    v
+                };
+                format!("(mkFp {} {} {} {})", limb(0), limb(1), limb(2), limb(3))
+            }
+        )),
+        "captured public instances must record the single `product` public input"
+    );
     // The accepting fixture must not carry a rejecting theorem.
     assert!(
         !fixture.contains("_ne_zero"),
@@ -256,7 +292,7 @@ fn rejects_non_identity_capture() {
             "Halo2.Fixture.RenderReject",
             "render_reject",
             K,
-            1,
+            &[&[&wrong_pubinputs[..]]],
             &transcript,
             &msm,
         )
