@@ -10,12 +10,16 @@
 //! across the VK, proof string, transcript, and MSM.
 //!
 //! Trust boundary: the fixture attests that the assembled MSM matches, and evaluates to the
-//! identity, for *these* captured commitments and challenges. It does not re-derive the instance
-//! commitments from the public inputs (they enter as opaque points, like every other commitment),
-//! nor does it reproduce Halo2's Blake2b transcript or pinned-key serialization; those remain
-//! trusted from the Rust capture. Halo2's `MSM` also merges same-base terms and drops identity
-//! bases, where the Lean assembly deliberately does neither; such a capture is rejected at export
-//! (see [`VerifyingKey::dump_vesta_lean_fixture`]) rather than emitted.
+//! identity, for *these* captured commitments and challenges. The emitted `vk` mirrors halo2's
+//! `VerifyingKey` field-for-field — circuit-fixed data only — so it stays faithful to the pinned Rust
+//! key; the instance commitment is *not* a VK field. Instead the fixture re-derives it from the
+//! public inputs (`commit_lagrange` of the zero-padded instance columns, exposed as
+//! `derivedInstanceCommitment`), feeds *that* to `assemble`, and checks it against the captured
+//! commitments (`instance_commitments_derived`), so instance commitments no longer enter as opaque
+//! points nor masquerade as VK data. It does not reproduce Halo2's Blake2b transcript or pinned-key
+//! serialization; those remain trusted from the Rust capture. Halo2's `MSM` also merges same-base
+//! terms and drops identity bases, where the Lean assembly deliberately does neither; such a capture
+//! is rejected at export (see [`VerifyingKey::dump_vesta_lean_fixture`]) rather than emitted.
 //!
 //! Only accepting runs are exported. [`VerifyingKey::dump_vesta_lean_fixture`] verifies the captured
 //! MSM is the group identity before emitting anything, so every exported fixture proves
@@ -26,14 +30,15 @@
 //! exporter surface for a cross-check that a trivially-accepting Lean `assemble` would already fail
 //! on the accepting fixtures.
 
-use ff::PrimeField;
+use ff::{Field, PrimeField};
+use group::Curve;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 
 use super::{ChallengeRecorder, TranscriptEvent};
 use crate::arithmetic::{Coordinates, CurveAffine};
 use crate::pasta::{EqAffine, Fp, Fq};
-use crate::poly::commitment::MSM;
+use crate::poly::commitment::{Blind, MSM};
 use crate::transcript::Challenge255;
 
 use super::super::circuit::{Any, Expression};
@@ -254,12 +259,19 @@ impl VerifyingKey<EqAffine> {
     /// verifier run; `captured_msm` is the assembled verifier fingerprint together with its exact
     /// parameter set. Only *accepting* runs are exported: `captured_msm` is verified to be the group
     /// identity before anything is emitted, so the fixture always proves `capturedMsm.evalNat = 0`.
+    ///
+    /// `instances` are the public inputs fed to the verifier for this run (`proof → column →
+    /// values`, matching the `instances` argument of [`super::capture_proof_fingerprint`]); their
+    /// outer length is the proof count. The exporter re-derives each instance commitment from them
+    /// (`commit_lagrange` of the zero-padded column) and fails fast unless it reproduces the
+    /// corresponding captured commitment, so the emitted `instance_commitments_derived` theorem —
+    /// the `public inputs → instance commitments` check — is always dischargeable.
     pub fn dump_vesta_lean_fixture<R: Read>(
         &self,
         lean_namespace: &str,
         circuit_id: &str,
         k: u32,
-        num_proofs: usize,
+        instances: &[&[&[Fp]]],
         recorder: &ChallengeRecorder<R, EqAffine, Challenge255<EqAffine>>,
         captured_msm: &MSM<'_, EqAffine>,
     ) -> String {
@@ -283,6 +295,9 @@ impl VerifyingKey<EqAffine> {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
             "circuit_id must be a non-empty ASCII slug (alphanumeric, `_`, `-`): {circuit_id:?}"
         );
+
+        // The public instances' outer dimension is the proof count, exactly as in `verify_proof`.
+        let num_proofs = instances.len();
 
         let common_points = recorder.common_points.as_slice();
         let read_points = recorder.points.as_slice();
@@ -332,6 +347,38 @@ impl VerifyingKey<EqAffine> {
         assert_eq!(msm_g.len(), n as usize);
         assert_eq!(common_points.len(), num_proofs * n_inst_cols);
         assert_eq!(challenges.len(), 11 + k as usize);
+
+        // ---- instance-commitment derivation (public inputs -> C_inst) ----
+        //
+        // The captured `common_points` are the Rust verifier's instance commitments, which
+        // otherwise enter Lean as opaque points. Re-derive each from the supplied public inputs
+        // exactly as `verify_proof` does — `commit_lagrange(zeroPad(column), Blind::default())` —
+        // and fail fast unless the supplied instances reproduce the captured commitments. This is
+        // the Rust ground truth for the emitted `instance_commitments_derived` theorem, which
+        // re-checks the same derivation independently in Lean (ironwood#65). `max_instance_len` is
+        // the longest instance column across all proofs; only the leading `g_lagrange` generators up
+        // to that length are reachable by a nonzero coefficient, so only they need exporting.
+        let mut max_instance_len = 0usize;
+        for (p, proof_instances) in instances.iter().enumerate() {
+            assert_eq!(
+                proof_instances.len(),
+                n_inst_cols,
+                "each proof must supply exactly `num_instance_columns` instance columns"
+            );
+            for (col, column) in proof_instances.iter().enumerate() {
+                max_instance_len = max_instance_len.max(column.len());
+                let mut poly = column.to_vec();
+                poly.resize(params.n as usize, Fp::ZERO);
+                let poly = self.domain.lagrange_from_vec(poly);
+                let derived = params.commit_lagrange(&poly, Blind::default()).to_affine();
+                assert_eq!(
+                    derived,
+                    common_points[p * n_inst_cols + col],
+                    "supplied public instances do not reproduce the captured instance commitment \
+                     for proof {p}, column {col}; the instance-commitment derivation could not hold"
+                );
+            }
+        }
 
         let expected_read_points = num_proofs * n_advice
             + num_proofs * n_lookups * 2
@@ -412,6 +459,11 @@ impl VerifyingKey<EqAffine> {
         let urs_g = points.point_refs(&params.g);
         let urs_w = points.point_ref(params.w);
         let urs_u = points.point_ref(params.u);
+        // Lagrange-basis generators actually reachable by a captured public instance: only the
+        // leading `max_instance_len` matter, since `commit_lagrange` multiplies every later
+        // generator by a zero (padding) coefficient. Exporting just this prefix keeps the fixture
+        // small while remaining an exact mirror of `commit_lagrange` on the captured instances.
+        let urs_g_lagrange = points.point_refs(&params.g_lagrange[..max_instance_len]);
 
         // The blocks below are a hand-maintained mirror of the verifier's read schedule; the
         // count asserts alone cannot catch an equal-length reordering. The Fiat-Shamir squeezes
@@ -737,11 +789,86 @@ impl VerifyingKey<EqAffine> {
             "def capturedInstanceCommitments : List G := [{}]\n\n",
             join(&inst_comm_points)
         ));
+
+        // ---- instance-commitment derivation: public inputs -> C_inst (ironwood#65) ----
+        //
+        // Export the captured public inputs and the Lagrange-basis prefix, then check in Lean that
+        // `commit_lagrange` of each zero-padded column reproduces the captured commitment. This
+        // closes the `public inputs -> instance commitments` gap that `capturedInstanceCommitments`
+        // otherwise leaves as opaque points; the same derivation is asserted in Rust above.
+        let public_instance_lits: Vec<String> = instances
+            .iter()
+            .flat_map(|proof_instances| {
+                proof_instances
+                    .iter()
+                    .map(|column| format!("[{}]", join_fps(column)))
+            })
+            .collect();
+        out.push_str(&format!(
+            "def capturedUrsGLagrange : List G := [{}]\n\n",
+            urs_g_lagrange.join(", ")
+        ));
+        out.push_str(
+            "/-- Captured public inputs, flattened as `proof * capturedNumInstanceColumns + column`\n",
+        );
+        out.push_str(
+            "(matching `capturedInstanceCommitments`); each entry is one instance column's\n",
+        );
+        out.push_str("values before zero-padding to the domain. -/\n");
+        out.push_str(&format!(
+            "def capturedPublicInstances : List (List Fp) := [{}]\n\n",
+            public_instance_lits.join(", ")
+        ));
+        out.push_str(
+            "/-- Commit to a zero-padded public-instance column against the Lagrange basis, exactly\n",
+        );
+        out.push_str("as halo2 `Params::commit_lagrange` with `Blind::default () = 1`:\n");
+        out.push_str("`(∑ i in range coeffs.length, coeffs[i] • gLagrange[i]) + w`. `capturedUrsGLagrange`\n");
+        out.push_str(
+            "lists only the leading generators a captured instance can reach; every later\n",
+        );
+        out.push_str("generator carries a zero padding coefficient (`capturedPublicInstances_within_lagrange`). -/\n");
+        out.push_str("def commitLagrange (coeffs : List Fp) : G :=\n");
+        out.push_str("  ((List.range coeffs.length).map\n");
+        out.push_str("    (fun i => (coeffs.getD i 0).val • capturedUrsGLagrange.getD i 0)).sum + capturedURS.w\n\n");
+        out.push_str("/-- The instance commitment the verifier uses, computed per proof and column from the\n");
+        out.push_str("public inputs — halo2 `verify_proof` derives this from its `instances` argument, not the\n");
+        out.push_str("VK. `assemble` consumes this in place of the removed `vk.instanceCommitment` field; by\n");
+        out.push_str("`instance_commitments_derived` it equals the captured commitment the deployed verifier used. -/\n");
+        out.push_str("def derivedInstanceCommitment (p : Fin shape.numProofs) (i : ℕ) : G :=\n");
+        out.push_str("  commitLagrange (capturedPublicInstances.getD (p.val * capturedNumInstanceColumns + i) [])\n\n");
+        out.push_str("/-- Every captured public-instance column fits within the exported Lagrange prefix, so\n");
+        out.push_str(
+            "`commitLagrange`'s `getD` never substitutes the identity for a needed generator. -/\n",
+        );
+        out.push_str("theorem capturedPublicInstances_within_lagrange :\n");
+        out.push_str("    capturedPublicInstances.all (fun c => decide (c.length ≤ capturedUrsGLagrange.length)) = true := by native_decide\n\n");
+        out.push_str("/-- The captured instance commitments are the `commit_lagrange` of the captured public\n");
+        out.push_str("inputs: this derives `public inputs → instance commitments` in Lean rather than trusting\n");
+        out.push_str("`capturedInstanceCommitments` as opaque points (ironwood#65). -/\n");
+        out.push_str("theorem instance_commitments_derived :\n");
+        out.push_str("    capturedPublicInstances.map commitLagrange = capturedInstanceCommitments := by native_decide\n\n");
+
         out.push_str(&format!(
             "def capturedPermutationCommonCommitments : List G := [{}]\n\n",
             join(&perm_comm_points)
         ));
 
+        // The `vk` literal mirrors halo2's `VerifyingKey` field-for-field: every entry below is read
+        // from the Rust VK (`self.domain`/`self.cs`/`self.fixed_commitments`/`self.permutation`). The
+        // instance commitment is deliberately *not* a field — halo2 computes it per proof inside
+        // `verify_proof` from the public inputs, not from the VK — so it is emitted separately as
+        // `derivedInstanceCommitment` and passed to `assemble`, keeping this `vk` faithful to the
+        // pinned Rust key rather than carrying a value synthesized from the capture.
+        out.push_str(
+            "/-- The verifying key, mirroring halo2's `VerifyingKey` (circuit-fixed data only). The\n",
+        );
+        out.push_str(
+            "instance commitment is intentionally absent: halo2 computes it per proof from the\n",
+        );
+        out.push_str(
+            "public inputs (see `derivedInstanceCommitment`), so it is not a VK field. -/\n",
+        );
         out.push_str("def vk : VerifyingKey shape Fp G := {\n");
         out.push_str(&format!("  omega := {},\n", fp(self.domain.get_omega())));
         out.push_str(&format!("  n := {},\n", n));
@@ -762,7 +889,6 @@ impl VerifyingKey<EqAffine> {
             fix_layout.join(", ")
         ));
         out.push_str("  fixedCommitment := fun i => capturedFixedCommitments.getD i 0,\n");
-        out.push_str("  instanceCommitment := fun p i => capturedInstanceCommitments.getD (p.val * capturedNumInstanceColumns + i) 0,\n");
         out.push_str("  permutationCommonCommitment := fun i => capturedPermutationCommonCommitments.getD i.val 0,\n");
         out.push_str(&format!(
             "  permutationChunks := [{}],\n",
@@ -1006,7 +1132,7 @@ impl VerifyingKey<EqAffine> {
         out.push_str(&format!("  uScalar := {},\n", fp(msm_u)));
         out.push_str(&format!("  other := [{}] }}\n\n", other_lits.join(", ")));
 
-        out.push_str("theorem fingerprint_matches : MsmMatch (assemble vk ps ch) capturedMsm := by native_decide\n\n");
+        out.push_str("theorem fingerprint_matches : MsmMatch (assemble vk derivedInstanceCommitment ps ch) capturedMsm := by native_decide\n\n");
         out.push_str("theorem capturedMsm_eval_eq_zero : capturedMsm.evalNat capturedURS = 0 := by native_decide\n\n");
         out.push_str(
             "/-- Meaningful jointly with `fingerprint_matches`: `assemble`'s zero-MSM rejection\n",
@@ -1014,7 +1140,7 @@ impl VerifyingKey<EqAffine> {
         out.push_str(
             "fallback also evaluates to zero, so this statement alone is not acceptance. -/\n",
         );
-        out.push_str("theorem assembledMsm_eval_eq_zero : (assemble vk ps ch).evalNat capturedURS = 0 := by\n");
+        out.push_str("theorem assembledMsm_eval_eq_zero : (assemble vk derivedInstanceCommitment ps ch).evalNat capturedURS = 0 := by\n");
         out.push_str("  rw [msmMatch_evalNat capturedURS fingerprint_matches]\n");
         out.push_str("  exact capturedMsm_eval_eq_zero\n\n");
         out.push_str(&format!("end {}\n", lean_namespace));

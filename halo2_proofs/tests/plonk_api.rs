@@ -599,7 +599,7 @@ fn plonk_api() {
                         "Halo2.Fixture.PlonkApi",
                         "plonk_api",
                         K,
-                        2,
+                        &[&[&pubinputs[..]], &[&pubinputs[..]]],
                         &transcript,
                         &msm,
                     )
